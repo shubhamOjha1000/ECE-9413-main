@@ -1,0 +1,22 @@
+[project]
+name = "assignment0"
+version = "0.0.0"
+description = "Assignment 0: Negacyclic NTT in JAX"
+requires-python = ">=3.11"
+dependencies = [
+    "jax[cpu]",
+    "numpy",
+    "rich",
+    "pytest",
+    "sympy",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]"]
+cuda13 = ["jax[cuda13]"]
+tpu = ["jax[tpu]"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
