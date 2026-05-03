@@ -1,30 +1,28 @@
 """
-Assignment 2 student implementation — v7: JIT Full SumCheck.
+Assignment 2 student implementation — v9: Production (auto-select v7 vs v8).
 
-Optimization over v6 (JIT full round):
-  - The entire sumcheck_32 function including the outer Python for-loop is
-    wrapped in @jax.jit via a factory function.
-  - JAX unrolls the Python for-loop at trace time → one giant XLA program
-    covering all num_rounds rounds.
-  - Zero Python overhead at runtime: all n rounds execute inside one XLA call
-    (1 dispatch instead of n dispatches).
-  - XLA can optimize across rounds — pipeline memory accesses between rounds.
-
-  Trade-off:
-  - Compile time is O(n) — grows linearly with num_rounds.
-  - For very large n (>=24), use lax.scan instead (constant compile time).
-  - For vars4/16/20 (n=4/16/20) compile time is acceptable.
+Final implementation combining all optimizations:
+  1. Stacked (V, N) SoA layout (v3)
+  2. Reshape split for coalesced GPU access (v4)
+  3. diff computed once, shared by vmap AND fold (v6)
+  4. vmap over degree evaluation points (v5)
+  5. Full JIT — zero Python overhead at runtime (v7/v8)
+  6. Auto-selects backend:
+       num_rounds <= 20 → JIT unroll (v7): faster runtime, XLA optimizes across rounds
+       num_rounds >  20 → lax.scan  (v8): O(1) compile time, constant regardless of n
+  7. Compile cache: each (expression, num_rounds) pair compiled only once.
 """
 
 from __future__ import annotations
 
 import jax
+import jax.lax as lax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 
 # -----------------------------------------------------------------------------
-# 32-bit primitives — JIT compiled (carried over from v1)
+# 32-bit primitives — JIT compiled
 # -----------------------------------------------------------------------------
 
 @jax.jit
@@ -157,53 +155,27 @@ def _build_term_indices(expression, var_order):
 
 
 # -----------------------------------------------------------------------------
-# Full JIT sumcheck factory (v7 key change)
+# v7 backend: JIT unroll (fast runtime, O(n) compile)
 # -----------------------------------------------------------------------------
 
-# Cache compiled functions per (expression, num_rounds) to avoid retracing.
-_sumcheck_cache = {}
-
-def _make_sumcheck_jit(expression, num_rounds):
-    """
-    Factory: bakes expression and num_rounds as static values at trace time.
-    Returns (jit_fn, var_order).
-
-    The Python for-loop over num_rounds is unrolled at trace time by JAX →
-    one XLA program covering all rounds. Zero Python overhead at runtime.
-    """
-    key = (tuple(tuple(t) for t in expression), num_rounds)
-    if key in _sumcheck_cache:
-        return _sumcheck_cache[key]
-
-    var_order    = sorted(set(v for term in expression for v in term))
-    term_indices = _build_term_indices(expression, var_order)
-    degree       = max(len(term) for term in expression)
-    n_eval       = degree + 1
+def _make_jit_unroll(expression, num_rounds, term_indices, var_order):
+    degree = max(len(term) for term in expression)
+    n_eval = degree + 1
 
     @jax.jit
-    def _sumcheck(stacked, q, challenges):
+    def _fn(stacked, q, challenges):
         t_vals = jnp.arange(n_eval, dtype=jnp.uint32)
-        """
-        stacked:    (V, 2^num_rounds) uint32 — tables in var_order row order
-        q:          uint32 scalar
-        challenges: (num_rounds-1,) uint32
-        """
         q64 = jnp.uint64(q)
         V   = stacked.shape[0]
         all_round_evals = []
 
-        # Python for-loop — unrolled at trace time into one XLA program
         for round_idx in range(num_rounds):
             N_k  = stacked.shape[1]
             half = N_k // 2
-
-            # Coalesced split
             view  = stacked.reshape(V, half, 2)
             evens = view[:, :, 0].astype(jnp.uint64)
             odds  = view[:, :, 1].astype(jnp.uint64)
-
-            # diff shared by vmap AND fold
-            diff = (odds + q64 - evens) % q64
+            diff  = (odds + q64 - evens) % q64
 
             def g_at_t(t):
                 tables_t = (diff * t.astype(jnp.uint64) % q64 + evens) % q64
@@ -215,40 +187,121 @@ def _make_sumcheck_jit(expression, num_rounds):
                     vals = (vals + tv) % q64
                 return (jnp.sum(vals) % q64).astype(jnp.uint32)
 
-            round_row = jax.vmap(g_at_t)(t_vals)   # (n_eval,)
+            round_row = jax.vmap(g_at_t)(t_vals)
             all_round_evals.append(round_row)
 
-            # Fold — reuses diff, no second HBM read
             if round_idx < num_rounds - 1:
                 r64     = challenges[round_idx].astype(jnp.uint64)
                 stacked = ((diff * r64 % q64 + evens) % q64).astype(jnp.uint32)
 
-        round_evals = jnp.stack(all_round_evals)   # (num_rounds, n_eval)
+        round_evals = jnp.stack(all_round_evals)
         claim0 = ((round_evals[0, 0].astype(jnp.uint64) +
                    round_evals[0, 1].astype(jnp.uint64)) % q64).astype(jnp.uint32)
         return claim0, round_evals
 
-    _sumcheck_cache[key] = (_sumcheck, var_order)
-    return _sumcheck, var_order
+    return _fn
 
 
 # -----------------------------------------------------------------------------
-# SumCheck prover — 32-bit v7 (JIT full sumcheck)
+# v8 backend: lax.scan (O(1) compile, fixed-buffer carry)
+# -----------------------------------------------------------------------------
+
+def _make_lax_scan(expression, num_rounds, term_indices, var_order):
+    degree = max(len(term) for term in expression)
+    n_eval = degree + 1
+
+    @jax.jit
+    def _fn(stacked, q, challenges):
+        t_vals = jnp.arange(n_eval, dtype=jnp.uint32)
+        q64  = jnp.uint64(q)
+        V, N = stacked.shape
+
+        r_padded = jnp.concatenate([
+            challenges,
+            jnp.zeros(num_rounds - challenges.shape[0], dtype=jnp.uint32)
+        ])
+
+        def round_body(carry, r):
+            buffer, active_len = carry
+            half = active_len // 2
+
+            active      = lax.dynamic_slice_in_dim(buffer, 0, active_len, axis=1)
+            active_view = active.reshape(V, half, 2)
+            evens = active_view[:, :, 0].astype(jnp.uint64)
+            odds  = active_view[:, :, 1].astype(jnp.uint64)
+            diff  = (odds + q64 - evens) % q64
+
+            def g_at_t(t):
+                tables_t = (diff * t.astype(jnp.uint64) % q64 + evens) % q64
+                vals = jnp.zeros(half, dtype=jnp.uint64)
+                for term in term_indices:
+                    tv = tables_t[term[0]]
+                    for idx in term[1:]:
+                        tv = (tv * tables_t[idx]) % q64
+                    vals = (vals + tv) % q64
+                return (jnp.sum(vals) % q64).astype(jnp.uint32)
+
+            round_evals_row = jax.vmap(g_at_t)(t_vals)
+
+            r64        = r.astype(jnp.uint64)
+            new_active = ((diff * r64 % q64 + evens) % q64).astype(jnp.uint32)
+            new_buffer = lax.dynamic_update_slice_in_dim(buffer, new_active, 0, axis=1)
+
+            return (new_buffer, half), round_evals_row
+
+        _, all_round_evals = lax.scan(round_body, (stacked, N), r_padded)
+
+        claim0 = ((all_round_evals[0, 0].astype(jnp.uint64) +
+                   all_round_evals[0, 1].astype(jnp.uint64)) % q64).astype(jnp.uint32)
+        return claim0, all_round_evals
+
+    return _fn
+
+
+# -----------------------------------------------------------------------------
+# Compile cache + auto-selector
+# -----------------------------------------------------------------------------
+
+_COMPILED_CACHE = {}
+
+def _get_compiled(expression, num_rounds):
+    """
+    Return cached (fn, var_order) for this (expression, num_rounds).
+    Auto-selects v7 (JIT unroll) for n<=20, v8 (lax.scan) for n>20.
+    """
+    cache_key = (tuple(tuple(t) for t in expression), num_rounds)
+    if cache_key in _COMPILED_CACHE:
+        return _COMPILED_CACHE[cache_key]
+
+    var_order    = sorted(set(v for term in expression for v in term))
+    term_indices = _build_term_indices(expression, var_order)
+
+    if num_rounds <= 20:
+        fn = _make_jit_unroll(expression, num_rounds, term_indices, var_order)
+    else:
+        fn = _make_lax_scan(expression, num_rounds, term_indices, var_order)
+
+    _COMPILED_CACHE[cache_key] = (fn, var_order)
+    return fn, var_order
+
+
+# -----------------------------------------------------------------------------
+# SumCheck prover — 32-bit v9 (production)
 # -----------------------------------------------------------------------------
 
 def sumcheck_32(eval_tables, *, q, expression, challenges, num_rounds):
     """
-    v7 32-bit SumCheck prover — entire function JIT'd, loop unrolled at trace time.
+    v9 production 32-bit SumCheck prover — all optimizations combined.
 
-    Changes from v6:
-      - Outer Python for-loop over num_rounds included inside @jax.jit.
-      - JAX unrolls all rounds at trace time → one XLA program, 1 dispatch.
-      - Compile time is O(num_rounds) — acceptable for n=4/16/20.
+    Auto-selects:
+      num_rounds <= 20 → JIT unroll (v7): faster runtime
+      num_rounds >  20 → lax.scan  (v8): O(1) compile time
+    Compiled functions are cached per (expression, num_rounds).
     Protocol order unchanged — no precomputation.
     """
-    sc_fn, var_order = _make_sumcheck_jit(expression, num_rounds)
-    stacked = _stack_tables(eval_tables, var_order)   # (V, N) uint32
-    return sc_fn(stacked, q, challenges)
+    fn, var_order = _get_compiled(expression, num_rounds)
+    stacked = _stack_tables(eval_tables, var_order)
+    return fn(stacked, q, challenges)
 
 
 def sumcheck_64(eval_tables, *, q, expression, challenges, num_rounds):
