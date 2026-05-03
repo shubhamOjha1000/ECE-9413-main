@@ -221,14 +221,12 @@ def _make_lax_scan(expression, num_rounds, term_indices, var_order):
             jnp.zeros(num_rounds - challenges.shape[0], dtype=jnp.uint32)
         ])
 
-        def round_body(carry, r):
-            buffer, active_len = carry
-            half = active_len // 2
+        half = N // 2  # static — N is concrete from stacked.shape
 
-            active      = lax.dynamic_slice_in_dim(buffer, 0, active_len, axis=1)
-            active_view = active.reshape(V, half, 2)
-            evens = active_view[:, :, 0].astype(jnp.uint64)
-            odds  = active_view[:, :, 1].astype(jnp.uint64)
+        def round_body(buf, r):
+            view  = buf.reshape(V, half, 2)
+            evens = view[:, :, 0].astype(jnp.uint64)
+            odds  = view[:, :, 1].astype(jnp.uint64)
             diff  = (odds + q64 - evens) % q64
 
             def g_at_t(t):
@@ -245,11 +243,13 @@ def _make_lax_scan(expression, num_rounds, term_indices, var_order):
 
             r64        = r.astype(jnp.uint64)
             new_active = ((diff * r64 % q64 + evens) % q64).astype(jnp.uint32)
-            new_buffer = lax.dynamic_update_slice_in_dim(buffer, new_active, 0, axis=1)
+            new_buf    = jnp.concatenate(
+                [new_active, jnp.zeros((V, half), dtype=jnp.uint32)], axis=1
+            )
 
-            return (new_buffer, half), round_evals_row
+            return new_buf, round_evals_row
 
-        _, all_round_evals = lax.scan(round_body, (stacked, N), r_padded)
+        _, all_round_evals = lax.scan(round_body, stacked, r_padded)
 
         claim0 = ((all_round_evals[0, 0].astype(jnp.uint64) +
                    all_round_evals[0, 1].astype(jnp.uint64)) % q64).astype(jnp.uint32)

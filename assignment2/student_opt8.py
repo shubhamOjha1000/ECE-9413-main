@@ -197,30 +197,16 @@ def _make_sumcheck_scan(expression, num_rounds):
             jnp.zeros(num_rounds - challenges.shape[0], dtype=jnp.uint32)
         ])
 
-        def round_body(carry, r):
-            """
-            carry = (buffer (V, N), active_len int32)
-            r     = challenge for this round (uint32)
+        half = N // 2  # static — N is concrete from stacked.shape
 
-            Fixed-size buffer trick: tables shrink each round but buffer stays (V, N).
-            Only the first active_len columns are valid; fold result written back
-            into first active_len//2 columns.
-            """
-            buffer, active_len = carry
-            half = active_len // 2
+        def round_body(buf, r):
+            # buf: (V, N) — valid data packed at front, rest zeros
+            # Reshape always uses static half = N//2; zero pairs contribute 0
+            view  = buf.reshape(V, half, 2)
+            evens = view[:, :, 0].astype(jnp.uint64)   # (V, half)
+            odds  = view[:, :, 1].astype(jnp.uint64)   # (V, half)
+            diff  = (odds + q64 - evens) % q64
 
-            # Extract active slice (shape-stable via dynamic_slice)
-            active = lax.dynamic_slice_in_dim(buffer, 0, active_len, axis=1)  # (V, active_len)
-
-            # Coalesced reshape split
-            active_view = active.reshape(V, half, 2)
-            evens = active_view[:, :, 0].astype(jnp.uint64)   # (V, half)
-            odds  = active_view[:, :, 1].astype(jnp.uint64)   # (V, half)
-
-            # diff computed ONCE — shared by vmap AND fold
-            diff = (odds + q64 - evens) % q64
-
-            # vmap: compute all g(t) using shared diff
             def g_at_t(t):
                 tables_t = (diff * t.astype(jnp.uint64) % q64 + evens) % q64
                 vals = jnp.zeros(half, dtype=jnp.uint64)
@@ -233,19 +219,16 @@ def _make_sumcheck_scan(expression, num_rounds):
 
             round_evals_row = jax.vmap(g_at_t)(t_vals)   # (n_eval,)
 
-            # Fold: reuse diff — no second HBM read
             r64        = r.astype(jnp.uint64)
             new_active = ((diff * r64 % q64 + evens) % q64).astype(jnp.uint32)  # (V, half)
+            # Pad fold result back to (V, N): zero pairs stay zero next round
+            new_buf = jnp.concatenate(
+                [new_active, jnp.zeros((V, half), dtype=jnp.uint32)], axis=1
+            )
 
-            # Write folded result back into first half of fixed buffer
-            new_buffer = lax.dynamic_update_slice_in_dim(
-                buffer, new_active, 0, axis=1
-            )  # (V, N) — only first half updated
+            return new_buf, round_evals_row
 
-            return (new_buffer, half), round_evals_row
-
-        init_carry = (stacked, N)
-        _, all_round_evals = lax.scan(round_body, init_carry, r_padded)
+        _, all_round_evals = lax.scan(round_body, stacked, r_padded)
         # all_round_evals: (num_rounds, n_eval)
 
         claim0 = ((all_round_evals[0, 0].astype(jnp.uint64) +
